@@ -6,7 +6,6 @@ from pathlib import Path
 from dotenv import dotenv_values, load_dotenv
 
 _env_path = Path(__file__).resolve().parent.parent / ".env"
-# Force-load backend/.env even if OPENAI_API_KEY exists as empty in shell env.
 load_dotenv(_env_path, override=True)
 import uuid
 from datetime import datetime
@@ -26,7 +25,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# In-memory storage
 cases: dict[str, dict] = {}
 
 ISSUE_TYPES = frozenset({"missed_service", "update_request", "other"})
