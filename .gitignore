@@ -11,6 +11,7 @@ node_modules/
 out/
 dist/
 build/
+*.tsbuildinfo
 *.egg-info/
 __pycache__/
 *.py[cod]
@@ -36,3 +37,9 @@ Thumbs.db
 # Logs
 *.log
 npm-debug.log*
+
+# Local support data
+backend/data/
+*.db
+*.db-shm
+*.db-wal

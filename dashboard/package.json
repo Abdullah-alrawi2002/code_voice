@@ -6,12 +6,12 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "next lint"
+    "lint": "tsc --noEmit"
   },
   "dependencies": {
-    "@openai/agents": "^0.7.0",
+    "@openai/agents": "^0.14.2",
     "zod": "^4.0.0",
-    "next": "14.2.0",
+    "next": "16.3.0",
     "react": "^18.3.0",
     "react-dom": "^18.3.0"
   },

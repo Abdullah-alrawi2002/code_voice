@@ -1,203 +1,240 @@
-"""FastAPI backend for case management."""
+"""FastAPI service for the Televic technical-support intake line."""
 
+from __future__ import annotations
+
+import asyncio
 import os
 from pathlib import Path
+from typing import Any
 
+import httpx
 from dotenv import dotenv_values, load_dotenv
-
-_env_path = Path(__file__).resolve().parent.parent / ".env"
-load_dotenv(_env_path, override=True)
-import uuid
-from datetime import datetime
-from typing import Literal
-
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from fastapi.responses import JSONResponse
+from openai import InvalidWebhookSignatureError, OpenAI
 
-app = FastAPI(title="Case Management API")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+from .agent_config import realtime_session_config
+from .models import (
+    CaseCreate,
+    CaseListResponse,
+    CaseRecord,
+    CaseUpdate,
+    FinalizeCallRequest,
 )
+from .sip import caller_phone_from_headers, monitor_sip_call
+from .store import CaseStore
 
-cases: dict[str, dict] = {}
-
-ISSUE_TYPES = frozenset({"missed_service", "update_request", "other"})
-STATUSES = frozenset({"new", "in_progress", "resolved"})
-
-
-class CreateCaseRequest(BaseModel):
-    name: str
-    phone: str
-    issue_type: Literal["missed_service", "update_request", "other"]
-    description: str
+BACKEND_DIR = Path(__file__).resolve().parent.parent
+ENV_PATH = BACKEND_DIR / ".env"
+load_dotenv(ENV_PATH, override=False)
 
 
-class UpdateCaseRequest(BaseModel):
-    status: str | None = None
-    notes: str | None = None
+def _setting(name: str, default: str = "") -> str:
+    value = (os.getenv(name) or "").strip()
+    if value:
+        return value
+    return str(dotenv_values(ENV_PATH).get(name) or default).strip()
 
 
-class Case(BaseModel):
-    id: str
-    name: str
-    phone: str
-    issue_type: str
-    description: str
-    status: str
-    notes: str
-    created_at: str
-    updated_at: str
+def _database_path() -> Path:
+    configured = _setting("DATABASE_PATH")
+    if configured:
+        path = Path(configured)
+        return path if path.is_absolute() else BACKEND_DIR / path
+    return BACKEND_DIR / "data" / "televic_support.db"
 
 
-@app.post("/cases", response_model=Case)
-def create_case(req: CreateCaseRequest):
-    if req.issue_type not in ISSUE_TYPES:
-        raise HTTPException(400, f"issue_type must be one of {list(ISSUE_TYPES)}")
-    now = datetime.utcnow().isoformat() + "Z"
-    case = {
-        "id": uuid.uuid4().hex[:8],
-        "name": req.name,
-        "phone": req.phone,
-        "issue_type": req.issue_type,
-        "description": req.description,
-        "status": "new",
-        "notes": "",
-        "created_at": now,
-        "updated_at": now,
-    }
-    cases[case["id"]] = case
-    return case
+def _event_value(event: Any, name: str, default: Any = None) -> Any:
+    if isinstance(event, dict):
+        return event.get(name, default)
+    return getattr(event, name, default)
 
 
-@app.get("/cases", response_model=list[Case])
-def list_cases():
-    return sorted(cases.values(), key=lambda c: c["created_at"], reverse=True)
+def create_app(database_path: str | Path | None = None) -> FastAPI:
+    app = FastAPI(
+        title="Televic Technical Support API",
+        version="1.0.0",
+        description="Structured voice intake and service-engineer case management.",
+    )
+    store = CaseStore(database_path or _database_path())
+    app.state.case_store = store
+    app.state.call_tasks = set()
 
+    origins = [
+        value.strip()
+        for value in _setting("ALLOWED_ORIGINS", "http://localhost:3000").split(",")
+        if value.strip()
+    ]
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=origins,
+        allow_credentials=True,
+        allow_methods=["GET", "POST", "PATCH", "OPTIONS"],
+        allow_headers=["*"],
+    )
 
-@app.get("/cases/{case_id}", response_model=Case)
-def get_case(case_id: str):
-    if case_id not in cases:
-        raise HTTPException(404, "Case not found")
-    return cases[case_id]
+    @app.get("/health")
+    def health() -> dict[str, str]:
+        return {"status": "ok", "service": "televic-support"}
 
+    @app.post("/cases", response_model=CaseRecord, status_code=201)
+    def create_case(payload: CaseCreate) -> CaseRecord:
+        return store.create_case(payload)
 
-@app.get("/cases/by-phone/{phone}", response_model=Case | None)
-def get_case_by_phone(phone: str):
-    for c in cases.values():
-        if c["phone"] == phone:
-            return c
-    return None
+    @app.get("/cases", response_model=CaseListResponse)
+    def list_cases(
+        status: str | None = None,
+        priority: str | None = None,
+        market: str | None = None,
+        q: str | None = None,
+        limit: int = Query(default=200, ge=1, le=500),
+        offset: int = Query(default=0, ge=0),
+    ) -> CaseListResponse:
+        return store.list_cases(
+            status=status,
+            priority=priority,
+            market=market,
+            query=q,
+            limit=limit,
+            offset=offset,
+        )
 
+    @app.get("/cases/stats")
+    def case_stats() -> dict[str, object]:
+        return store.summary_counts()
 
-@app.patch("/cases/{case_id}", response_model=Case)
-def update_case(case_id: str, req: UpdateCaseRequest):
-    if case_id not in cases:
-        raise HTTPException(404, "Case not found")
-    case = cases[case_id]
-    if req.status is not None:
-        if req.status not in STATUSES:
-            raise HTTPException(400, f"status must be one of {list(STATUSES)}")
-        case["status"] = req.status
-    if req.notes is not None:
-        case["notes"] = req.notes
-    case["updated_at"] = datetime.utcnow().isoformat() + "Z"
-    return case
+    @app.get("/cases/by-phone/{phone}", response_model=CaseRecord | None)
+    def get_case_by_phone(phone: str) -> CaseRecord | None:
+        return store.get_latest_by_phone(phone)
 
+    @app.get("/cases/{case_id}", response_model=CaseRecord)
+    def get_case(case_id: str) -> CaseRecord:
+        case = store.get_case(case_id)
+        if case is None:
+            raise HTTPException(404, "Case not found")
+        return case
 
-@app.post("/voice/token")
-def get_voice_token():
-    """Return an OpenAI Realtime ephemeral client secret for the voice agent."""
-    import httpx
-    api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
-    if not api_key:
-        file_key = (dotenv_values(_env_path).get("OPENAI_API_KEY") or "").strip()
-        api_key = file_key
-    if not api_key:
-        raise HTTPException(500, "OPENAI_API_KEY must be set")
-    try:
-        r = httpx.post(
-            "https://api.openai.com/v1/realtime/client_secrets",
+    @app.get("/cases/{case_id}/export")
+    def export_case(case_id: str) -> JSONResponse:
+        payload = store.export_case(case_id)
+        if payload is None:
+            raise HTTPException(404, "Case not found")
+        return JSONResponse(
+            payload,
             headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
+                "Content-Disposition": (
+                    f'attachment; filename="{case_id.upper()}-service-report.json"'
+                )
             },
-            json={
-                "session": {
-                    "type": "realtime",
-                    "model": "gpt-realtime",
+        )
+
+    @app.patch("/cases/{case_id}", response_model=CaseRecord)
+    def update_case(case_id: str, update: CaseUpdate) -> CaseRecord:
+        case = store.update_case(case_id, update)
+        if case is None:
+            raise HTTPException(404, "Case not found")
+        return case
+
+    @app.post("/voice/token")
+    async def get_voice_token() -> dict[str, str | None]:
+        """Create a short-lived browser credential for a Realtime voice session."""
+
+        api_key = _setting("OPENAI_API_KEY")
+        if not api_key:
+            raise HTTPException(500, "OPENAI_API_KEY must be set")
+        model = _setting("OPENAI_REALTIME_MODEL", "gpt-realtime-2.1")
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.post(
+                "https://api.openai.com/v1/realtime/client_secrets",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
                 },
-            },
-            timeout=10.0,
-        )
-        r.raise_for_status()
-        data = r.json()
-        return {"token": data.get("value", ""), "url": None}
-    except httpx.HTTPStatusError as e:
-        raise HTTPException(e.response.status_code, e.response.text)
+                json={"session": {"type": "realtime", "model": model}},
+            )
+        if response.is_error:
+            raise HTTPException(response.status_code, response.text)
+        data = response.json()
+        return {"token": data.get("value", ""), "model": model, "url": None}
+
+    @app.post("/voice/finalize")
+    def finalize_browser_call(payload: FinalizeCallRequest) -> dict[str, object]:
+        if not payload.case_id:
+            return {
+                "attached": False,
+                "case_id": None,
+                "message": "The call ended before a support case was filed.",
+            }
+        case = store.attach_transcript(payload.case_id, payload.transcript)
+        if case is None:
+            raise HTTPException(404, "Case not found")
+        return {
+            "attached": True,
+            "case_id": case.id,
+            "priority": case.priority,
+            "message": "Transcript attached to the service report.",
+        }
+
+    @app.post("/webhooks/openai")
+    async def openai_realtime_webhook(request: Request) -> Response:
+        """Accept signed Realtime SIP calls and start the sideband controller."""
+
+        webhook_secret = _setting("OPENAI_WEBHOOK_SECRET")
+        api_key = _setting("OPENAI_API_KEY")
+        if not webhook_secret or not api_key:
+            raise HTTPException(
+                503,
+                "OPENAI_WEBHOOK_SECRET and OPENAI_API_KEY are required for phone calls",
+            )
+
+        raw_body = await request.body()
+        try:
+            event = OpenAI(webhook_secret=webhook_secret).webhooks.unwrap(
+                raw_body, request.headers
+            )
+        except InvalidWebhookSignatureError:
+            raise HTTPException(400, "Invalid webhook signature")
+
+        if _event_value(event, "type") != "realtime.call.incoming":
+            return JSONResponse({"received": True, "ignored": True})
+
+        event_id = str(_event_value(event, "id", ""))
+        data = _event_value(event, "data", {})
+        call_id = str(_event_value(data, "call_id", ""))
+        sip_headers = _event_value(data, "sip_headers", [])
+        if not event_id or not call_id:
+            raise HTTPException(400, "Incoming call event is missing an ID or call ID")
+        if not store.mark_webhook_processed(event_id):
+            return JSONResponse({"received": True, "duplicate": True})
+
+        caller_phone = caller_phone_from_headers(sip_headers)
+        store.start_call(call_id, caller_phone)
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                accept_response = await client.post(
+                    f"https://api.openai.com/v1/realtime/calls/{call_id}/accept",
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json=realtime_session_config(caller_phone),
+                )
+            if accept_response.is_error:
+                raise HTTPException(accept_response.status_code, accept_response.text)
+        except Exception:
+            store.remove_webhook_event(event_id)
+            store.finish_call(
+                call_id, case_id=None, transcript="", status="accept_failed"
+            )
+            raise
+
+        task = asyncio.create_task(monitor_sip_call(store, call_id))
+        app.state.call_tasks.add(task)
+        task.add_done_callback(app.state.call_tasks.discard)
+        return JSONResponse({"received": True, "call_id": call_id})
+
+    return app
 
 
-class SummarizeRequest(BaseModel):
-    transcript: str
-    case_id: str | None = None
-
-
-def _extract_case_id(transcript: str) -> str | None:
-    import re
-    m = re.search(r"ID:\s*([a-f0-9]{8})", transcript, re.IGNORECASE)
-    if m:
-        return m.group(1)
-    m = re.search(r"case\s+(?:id|created)[:\s]+([a-f0-9]{8})", transcript, re.IGNORECASE)
-    if m:
-        return m.group(1)
-    m = re.search(r"\b([a-f0-9]{8})\b", transcript)
-    if m:
-        return m.group(1)
-    return None
-
-
-@app.post("/voice/summarize")
-def summarize_call(req: SummarizeRequest):
-    """Generate a call summary and attach it to the case if one was created."""
-    import httpx
-    api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
-    if not api_key:
-        file_key = (dotenv_values(_env_path).get("OPENAI_API_KEY") or "").strip()
-        api_key = file_key
-    if not api_key:
-        raise HTTPException(500, "OPENAI_API_KEY must be set")
-    transcript = (req.transcript or "").strip()
-    if not transcript:
-        return {"summary": "No transcript.", "case_id": None, "attached": False}
-    try:
-        r = httpx.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json={
-                "model": "gpt-4o-mini",
-                "messages": [
-                    {"role": "system", "content": "Summarize this customer service call in 2-3 sentences. Include: caller intent, any case created or looked up, and outcome."},
-                    {"role": "user", "content": transcript},
-                ],
-                "max_tokens": 200,
-            },
-            timeout=15.0,
-        )
-        r.raise_for_status()
-        data = r.json()
-        summary = (data.get("choices") or [{}])[0].get("message", {}).get("content", "").strip() or "Summary unavailable."
-        case_id = req.case_id or _extract_case_id(transcript)
-        attached = False
-        if case_id and case_id in cases:
-            prefix = "[Call summary] " if not cases[case_id]["notes"] else "\n\n[Call summary] "
-            cases[case_id]["notes"] = (cases[case_id]["notes"] or "").rstrip() + prefix + summary
-            cases[case_id]["updated_at"] = datetime.utcnow().isoformat() + "Z"
-            attached = True
-        return {"summary": summary, "case_id": case_id, "attached": attached}
-    except httpx.HTTPStatusError as e:
-        raise HTTPException(e.response.status_code, e.response.text)
+app = create_app()
